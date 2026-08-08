@@ -1,0 +1,52 @@
+{
+  "health_buff": 1.0,
+  "height": 128,
+  "level_key": 11,
+  "marks": 100,
+  "name": "Surrounded",
+  "png_base64": "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",
+  "spawners": [
+    {
+      "amount": 2932,
+      "duration": 35.0,
+      "vx": 0,
+      "vy": -50,
+      "x": 22,
+      "y": 129
+    },
+    {
+      "amount": 2932,
+      "duration": 35.0,
+      "vx": 0,
+      "vy": 50,
+      "x": 64,
+      "y": -2
+    },
+    {
+      "amount": 2932,
+      "duration": 35.0,
+      "vx": 0,
+      "vy": 50,
+      "x": 100,
+      "y": -2
+    },
+    {
+      "amount": 2932,
+      "duration": 35.0,
+      "vx": -50,
+      "vy": 0,
+      "x": 128,
+      "y": 94
+    },
+    {
+      "amount": 1000,
+      "duration": 20.0,
+      "vx": 0,
+      "vy": -50,
+      "x": 58,
+      "y": 129
+    }
+  ],
+  "style_level": 10,
+  "width": 128
+}

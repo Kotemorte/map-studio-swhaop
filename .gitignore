@@ -1,0 +1,10 @@
+# Godot и системный мусор
+.godot/
+*.tmp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Карты, которые игрок положил в папку обмена локально
+mods/map_studio/maps/*.json
+!mods/map_studio/maps/Surrounded.json
