@@ -6,14 +6,36 @@ const REFRESH_INTERVAL := 0.25
 const AUTHOR_URL := "https://steamcommunity.com/id/Kotemorte86"
 
 const UI_LAYER := 128
+const SHELF_LAYER := 129
 
 var _layer: CanvasLayer
 var _root: Control
+var _card: PanelContainer
 var _tabs: TabContainer
 var _status: Label
 var _refreshers: Array[Callable] = []
 var _accum := 0.0
 var _pause_while_open := false
+
+const SIM_STEP := 1.0 / 60.0
+const SPEED_LIMIT := 256.0
+var _fast := 1.0
+var _fast_edit: LineEdit
+var _frozen := false
+var _set_game_speed: Callable = func(_s: float) -> void: pass
+
+const SIM_OWNER_META := &"orc_sim_owner"
+const SIM_OWNER_NAME := "map_studio"
+
+var _immortal := false
+var _immortal_hp := -1.0
+
+const TOWERS_FILE := "user://map_studio_towers.json"
+var _ed_cur_path := ""
+var _towers_saved: Dictionary = {}
+var _towers_pending := ""
+var _towers_old_battle := 0
+var _towers_accum := 0.0
 
 var _ts_touched := false
 
@@ -123,6 +145,8 @@ func _ready() -> void:
 
 	_ach_guard()
 
+	_towers_read_file()
+
 	_load_locale()
 	_build_ui()
 
@@ -134,6 +158,11 @@ func _rebuild_ui() -> void:
 	_refreshers.clear()
 	if _layer != null and is_instance_valid(_layer):
 		_layer.queue_free()
+	for card in [_card, _live_bar]:
+		if card != null and is_instance_valid(card):
+			card.queue_free()
+	_card = null
+	_live_bar = null
 	_build_ui()
 
 func _build_ui() -> void:
@@ -146,27 +175,13 @@ func _build_ui() -> void:
 	_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_layer.add_child(_root)
 
-	var panel := PanelContainer.new()
-	panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
-	panel.position = Vector2(16, 16)
-	panel.custom_minimum_size = Vector2(1010, 700)
-	panel.mouse_filter = Control.MOUSE_FILTER_STOP
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.07, 0.08, 0.10, 0.96)
-	sb.border_color = Color(0.35, 0.75, 0.45)
-	sb.set_border_width_all(2)
-	sb.set_corner_radius_all(6)
-	sb.set_content_margin_all(10)
-	panel.add_theme_stylebox_override("panel", sb)
-	_root.add_child(panel)
-
-	var outer := VBoxContainer.new()
-	outer.add_theme_constant_override("separation", 6)
-	panel.add_child(outer)
+	_card = _shelf_card("MAP STUDIO", Color(0.35, 0.75, 0.45))
+	_card.visible = false
+	var outer := _card_body(_card)
+	outer.custom_minimum_size = Vector2(1010, 660)
 
 	var head := _row(outer)
-	_lbl(head, "MAP STUDIO", 18, Color(0.45, 0.9, 0.55))
-	_lbl(head, _t("   F1 закрыть · F2 рисовать прямо по бою · F5 перезагрузить мод"),
+	_lbl(head, _t("F1 закрыть · F2 рисовать прямо по бою · F5 перезагрузить мод"),
 		12, Color(0.5, 0.55, 0.6))
 
 	_tabs = TabContainer.new()
@@ -183,13 +198,14 @@ func _build_ui() -> void:
 	_build_editor()
 	_build_about()
 
-	_root.visible = false
+	_card.visible = false
 	_say(_t("Map Studio загружена"))
 
 func _process(delta: float) -> void:
 	_enforce_custom_speed()
 	_auto_unregister(delta)
 	_watch_locale(delta)
+	_towers_watch(delta)
 
 	var sc := get_tree().current_scene
 	var sid: int = sc.get_instance_id() if sc != null else 0
@@ -205,9 +221,12 @@ func _process(delta: float) -> void:
 
 	if _ts_touched and not _is_own_battle():
 		Engine.time_scale = 1.0
+		_fast = 1.0
+		if _frozen:
+			_freeze_battle(false)
 		_ts_touched = false
 
-	if not _root.visible:
+	if not _card.visible:
 		return
 	_accum += delta
 	if _accum < REFRESH_INTERVAL:
@@ -252,7 +271,7 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 		return
 
-	if (_root.visible or _browser_visible()) and k.keycode in [KEY_ESCAPE, KEY_D]:
+	if (_card.visible or _browser_visible()) and k.keycode in [KEY_ESCAPE, KEY_D]:
 		get_viewport().set_input_as_handled()
 
 func _browser_visible() -> bool:
@@ -329,16 +348,173 @@ func _menu_buttons_node() -> Node:
 			stack.append(c)
 	return null
 
+func _physics_process(_delta: float) -> void:
+	_hold_base()
+	if _sim_taken():
+		if _frozen:
+			_freeze_battle(false)
+			_fast = 1.0
+			_ts_touched = false
+			_say(_t("заморозка снята: боем сейчас управляет другой мод"))
+		return
+	if _fast <= 1.0 or not _is_own_battle():
+		return
+	var b := _battle()
+	if b == null:
+		return
+	if int(_get(b, "phase", 0)) != 1:
+		return
+	if get_tree().paused:
+		return
+	var gs := get_node_or_null("/root/GPUSim")
+	if gs == null:
+		return
+	var spawners: Array = []
+	var towers: Array = []
+	var holder := b.get_node_or_null("TowerLayer/EnemySpawners")
+	if holder != null:
+		spawners = holder.get_children()
+	var tp := _find_node_by_name(b, "TowerPlacement")
+	if tp != null:
+		towers = tp.get_children()
+	for i in int(round(clampf(_fast, 1.0, SPEED_LIMIT))) - 1:
+		gs.call("_physics_process", SIM_STEP)
+		for sp in spawners:
+			if sp.has_method("_physics_process"):
+				sp.call("_physics_process", SIM_STEP)
+		for tw in towers:
+			if tw.has_method("_physics_process"):
+				tw.call("_physics_process", SIM_STEP)
+		_hold_base()
+
+func _hold_base() -> void:
+	if not _immortal or _sim_taken() or not _is_own_battle():
+		_immortal_hp = -1.0
+		return
+	var b := _battle()
+	if b == null:
+		_immortal_hp = -1.0
+		return
+	var hp := float(_get(b, "health", 0.0))
+	if _immortal_hp < 0.0 or int(_get(b, "phase", 0)) == 0:
+		_immortal_hp = hp
+		return
+	if hp < _immortal_hp:
+		b.set("health", _immortal_hp)
+
+func _sim_taken() -> bool:
+	var root := get_tree().root
+	if not root.has_meta(SIM_OWNER_META):
+		return false
+	return String(root.get_meta(SIM_OWNER_META)) != SIM_OWNER_NAME
+
+func _freeze_battle(on: bool) -> void:
+	_frozen = on
+	var gs := get_node_or_null("/root/GPUSim")
+	if gs != null:
+		gs.set_physics_process(not on)
+	var b := _battle()
+	if b == null:
+		return
+	var holder := b.get_node_or_null("TowerLayer/EnemySpawners")
+	if holder != null:
+		for sp in holder.get_children():
+			sp.set_physics_process(not on)
+
+func _shelf() -> VBoxContainer:
+	var root := get_tree().root
+	var layer := root.get_node_or_null("ModShelf")
+	if layer == null:
+		layer = CanvasLayer.new()
+		layer.name = "ModShelf"
+		(layer as CanvasLayer).layer = SHELF_LAYER
+		layer.process_mode = Node.PROCESS_MODE_ALWAYS
+		var col := VBoxContainer.new()
+		col.name = "Box"
+		col.position = Vector2(16, 16)
+		col.add_theme_constant_override("separation", 6)
+		layer.add_child(col)
+		root.add_child(layer)
+	return layer.get_node("Box") as VBoxContainer
+
+func _shelf_card(title: String, accent: Color) -> PanelContainer:
+	var card := PanelContainer.new()
+	card.mouse_filter = Control.MOUSE_FILTER_STOP
+	card.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.07, 0.08, 0.10, 0.95)
+	sb.border_color = accent
+	sb.set_border_width_all(2)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(8)
+	card.add_theme_stylebox_override("panel", sb)
+
+	var col := VBoxContainer.new()
+	col.name = "Col"
+	col.add_theme_constant_override("separation", 4)
+	card.add_child(col)
+
+	var head := Button.new()
+	head.name = "Head"
+	head.text = "▾ " + title
+	head.toggle_mode = true
+	head.button_pressed = true
+	head.flat = true
+	head.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	head.add_theme_font_size_override("font_size", 13)
+	head.add_theme_color_override("font_color", accent)
+	col.add_child(head)
+
+	var body := VBoxContainer.new()
+	body.name = "Body"
+	body.add_theme_constant_override("separation", 6)
+	col.add_child(body)
+
+	head.toggled.connect(func(on: bool) -> void:
+		body.visible = on
+		head.text = ("▾ " if on else "▸ ") + title)
+
+	_shelf_attach.call_deferred(card)
+	return card
+
+func _shelf_attach(card: Control) -> void:
+	if is_instance_valid(card):
+		_shelf().add_child(card)
+
+func _card_body(card: PanelContainer) -> VBoxContainer:
+	return card.get_node("Col/Body") as VBoxContainer
+
+func _exit_tree() -> void:
+	for card in [_card, _live_bar]:
+		if card != null and is_instance_valid(card):
+			card.queue_free()
+
 func _hide_game_menu() -> void:
 	var host := _menu_buttons_node()
 	if host == null:
 		return
+	var b := _battle()
+	var was_build: bool = b != null and int(_get(b, "phase", 1)) == 0
+	var was_paused := get_tree().paused
+
 	var n: Node = host
 	while n != null:
 		if n.has_method("hide_menu"):
 			n.call("hide_menu")
-			return
+			break
 		n = n.get_parent()
+
+	if was_build:
+		_keep_build_phase(b, was_paused)
+
+func _keep_build_phase(b: Node, paused: bool) -> void:
+	for i in 8:
+		if b == null or not is_instance_valid(b):
+			return
+		if int(_get(b, "phase", 0)) != 0:
+			b.set("phase", 0)
+		get_tree().paused = paused
+		await get_tree().process_frame
 
 func _menu_button_index(host: Node) -> int:
 	var after := ["LoadGame", "NewGame", "Continue", "Resume"]
@@ -359,9 +535,9 @@ func _find_node_by_name(root: Node, wanted: String) -> Node:
 	return null
 
 func _toggle() -> void:
-	_root.visible = not _root.visible
+	_card.visible = not _card.visible
 	_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	if _root.visible:
+	if _card.visible:
 		_accum = REFRESH_INTERVAL
 		_ed_refresh_files()
 		if _pause_while_open:
@@ -419,7 +595,9 @@ func _live_toggle() -> void:
 		_live_name.text = _t("моя_карта")
 	_live_on = true
 	_live_overlay.visible = true
-	_root.visible = false
+	if _live_bar != null:
+		_live_bar.visible = true
+	_card.visible = false
 	if not get_tree().paused:
 		get_tree().paused = true
 		_live_paused_by_us = true
@@ -429,6 +607,8 @@ func _live_exit() -> void:
 	_live_on = false
 	if _live_overlay:
 		_live_overlay.visible = false
+	if _live_bar != null and is_instance_valid(_live_bar):
+		_live_bar.visible = false
 	if _live_paused_by_us:
 		get_tree().paused = false
 		_live_paused_by_us = false
@@ -444,26 +624,17 @@ func _live_build_ui() -> void:
 	_live_overlay.gui_input.connect(_live_input)
 	_layer.add_child(_live_overlay)
 
-	_live_bar = PanelContainer.new()
-	_live_bar.position = Vector2(16, 16)
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.07, 0.08, 0.10, 0.95)
-	sb.border_color = Color(0.35, 0.75, 0.45)
-	sb.set_border_width_all(2)
-	sb.set_corner_radius_all(6)
-	sb.set_content_margin_all(8)
-	_live_bar.add_theme_stylebox_override("panel", sb)
-	_live_overlay.add_child(_live_bar)
+	_live_bar = _shelf_card(_t("РИСОВАНИЕ ПО БОЮ"), Color(0.35, 0.75, 0.45))
+	var body := _card_body(_live_bar)
 
 	var sc := ScrollContainer.new()
 	sc.custom_minimum_size = Vector2(980, 300)
 	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	_live_bar.add_child(sc)
+	body.add_child(sc)
 
 	var v := VBoxContainer.new()
 	v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	sc.add_child(v)
-	_lbl(v, _t("РИСОВАНИЕ ПО БОЮ"), 16, Color(0.45, 0.9, 0.55))
 	_live_info = Label.new()
 	_live_info.add_theme_font_size_override("font_size", 12)
 	_live_info.add_theme_color_override("font_color", Color(0.75, 0.78, 0.82))
@@ -514,7 +685,7 @@ func _live_build_ui() -> void:
 	_btn(r2, _t("В редактор карт"), func() -> void:
 		_live_to_editor()
 		_live_exit()
-		_root.visible = true)
+		_card.visible = true)
 	_btn(r2, _t("Выход (F2)"), func() -> void: _live_exit())
 
 	_sep(v)
@@ -543,7 +714,7 @@ func _live_build_ui() -> void:
 			lbat.text = _t("  не в бою")
 			return
 		if not _is_own_battle():
-			lbat.text = _t("  идёт уровень игры — управление боем недоступно")
+			lbat.text = _t("  идёт уровень игры, управление боем недоступно")
 			return
 		lbat.text = _t("  фаза %s   HP базы %.0f   живых %s   убито %s   всего врагов %s") % [
 			bb.get("phase"), float(_get(bb, "health", 0.0)),
@@ -551,19 +722,53 @@ func _live_build_ui() -> void:
 			bb.get("total_enemies_to_spawn")])
 
 	var lspeed := _lbl(game_box, "", 13, Color(1.0, 0.85, 0.35))
-	var set_ts := func(s: float) -> void:
+	var show_speed := func() -> void:
+		if _frozen:
+			lspeed.text = _t("  бой заморожен")
+		else:
+			lspeed.text = _t("  скорость: %dx") % int(round(_fast))
+	_set_game_speed = func(s: float) -> void:
 		if not _is_own_battle():
 			_say(_t("скорость меняется только на своей карте"))
 			return
-		Engine.time_scale = clampf(s, 0.0, 15.0)
-		_ts_touched = not is_equal_approx(Engine.time_scale, 1.0)
-		lspeed.text = _t("  скорость: %.2fx") % Engine.time_scale
+		if is_zero_approx(s):
+			_freeze_battle(true)
+			_fast = 1.0
+		else:
+			var asked := s
+			_fast = clampf(s, 1.0, SPEED_LIMIT)
+			if _frozen:
+				_freeze_battle(false)
+			if asked > SPEED_LIMIT:
+				_say(_t("быстрее %dx нельзя, поставил %dx") % [
+					int(SPEED_LIMIT), int(SPEED_LIMIT)])
+		_ts_touched = _fast > 1.0 or _frozen
+		if _fast_edit != null:
+			_fast_edit.text = "%d" % int(round(_fast))
+		show_speed.call()
 	var rs1 := _row(game_box)
-	for s in [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 15.0]:
-		_btn(rs1, ("%.2f" % s).trim_suffix("0").trim_suffix("0").trim_suffix(".") + "x",
-			func() -> void: set_ts.call(s))
-	lspeed.text = _t("  скорость: %.2fx") % Engine.time_scale
-	_lbl(game_box, _t("  0x — полная заморозка, удобно рассматривать карту. Вне своей карты скорость всегда обычная."),
+	for s in [0.0, 1.0, 4.0, 8.0, 16.0, 32.0]:
+		_btn(rs1, (_t("стоп") if is_zero_approx(s) else "%dx" % int(s)),
+			func() -> void: _set_game_speed.call(s))
+	_fast_edit = LineEdit.new()
+	_fast_edit.custom_minimum_size.x = 60
+	_fast_edit.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_fast_edit.text = "1"
+	_fast_edit.tooltip_text = _t("Своя скорость, до %dx") % int(SPEED_LIMIT)
+	_fast_edit.text_submitted.connect(func(txt: String) -> void:
+		var digits := txt.strip_edges().replace("x", "")
+		if digits.is_valid_float():
+			_set_game_speed.call(float(digits)))
+	rs1.add_child(_fast_edit)
+	show_speed.call()
+	_lbl(game_box, _t("  Ускоряем числом шагов симуляции, а не множителем времени: множитель раздувает шаг, и орки начинают проходить сквозь стены. «стоп» морозит только бой: меню и панели продолжают работать. Ускорение действует на идущий бой, само его не начинает. Вне своей карты скорость всегда обычная."),
+		12, Color(0.6, 0.62, 0.66))
+
+	_check(game_box, _t("База бессмертна"), _immortal, func(on: bool) -> void:
+		_immortal = on
+		_immortal_hp = -1.0
+		_say(_t("база бессмертна") if on else _t("база уязвима, как обычно")))
+	_lbl(game_box, _t("  Запас базы держится на том значении, какое было при включении. Удобно смотреть, докуда доходит волна, не проигрывая бой. Победу и поражение игра при этом считает сама."),
 		12, Color(0.6, 0.62, 0.66))
 
 	var rb := _row(game_box)
@@ -2201,15 +2406,157 @@ func _ed_play() -> void:
 	gm.set("selected_level", CUSTOM_LEVEL_KEY)
 	_ed_say(_t("запускаю «%s», скорость орков %.0f (как на уровне %d)") % [
 		_ed_name_edit.text, SPEED_BASE + SPEED_PER_LEVEL * _ed_level_key, _ed_level_key])
+	_towers_pending = _towers_key()
+	_towers_accum = 0.0
+	var old := _battle()
+	_towers_old_battle = old.get_instance_id() if old != null else 0
 	if gm.has_method("load_level"):
 		gm.call("load_level", CUSTOM_LEVEL_KEY)
-	_root.visible = false
+	_card.visible = false
 
 func _ed_unregister() -> void:
 	var levels: Dictionary = _get(_gm(), "levels", {})
 	if levels.has(CUSTOM_LEVEL_KEY):
 		levels.erase(CUSTOM_LEVEL_KEY)
 	_ed_custom_registered = false
+
+func _towers_key() -> String:
+	if _ed_cur_path != "":
+		return _ed_cur_path.get_file()
+	if _ed_name_edit != null and _ed_name_edit.text.strip_edges() != "":
+		return "имя:" + _ed_name_edit.text.strip_edges()
+	return ""
+
+func _towers_read_file() -> void:
+	_towers_saved = {}
+	var f := FileAccess.open(TOWERS_FILE, FileAccess.READ)
+	if f == null:
+		return
+	var parsed: Variant = JSON.parse_string(f.get_as_text())
+	f.close()
+	if parsed is Dictionary:
+		_towers_saved = parsed
+
+func _towers_write_file() -> void:
+	var f := FileAccess.open(TOWERS_FILE, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string(JSON.stringify(_towers_saved, "\t"))
+	f.close()
+
+func _tower_placement() -> Node:
+	var b := _battle()
+	return _find_node_by_name(b, "TowerPlacement") if b != null else null
+
+func _towers_snapshot() -> Array:
+	var out: Array = []
+	var tp := _tower_placement()
+	if tp == null:
+		return out
+	for c in tp.get_children():
+		if not bool(_get(c, "was_constructed", false)):
+			continue
+		if not c.has_method("save_to_data"):
+			continue
+		var d: Variant = c.call("save_to_data")
+		if d is Dictionary:
+			out.append(d)
+	return out
+
+func _towers_apply(list: Array) -> int:
+	var tp := _tower_placement()
+	if tp == null or not tp.has_method("_spawn_tower_at_pos"):
+		return 0
+	var present: Dictionary = {}
+	for c in tp.get_children():
+		present[_towers_pos_key(c.get("global_position"))] = true
+
+	var added := 0
+	for rec in list:
+		if not (rec is Dictionary):
+			continue
+		var d: Dictionary = rec
+		var pos := _towers_vec(d.get("position"))
+		if present.has(_towers_pos_key(pos)):
+			continue
+		var kind := _towers_kind(d.get("kind"))
+		if kind < 0:
+			continue
+		tp.call("_spawn_tower_at_pos", kind, pos)
+		var kids := tp.get_children()
+		if kids.is_empty():
+			continue
+		var t: Node = kids[kids.size() - 1]
+		if d.has("target_pos"):
+			t.set("target_pos", _towers_vec(d.get("target_pos")))
+			if t.has_method("update_targeting"):
+				t.call("update_targeting")
+		if t.has_method("construct"):
+			t.call("construct")
+		present[_towers_pos_key(pos)] = true
+		added += 1
+	return added
+
+func _towers_kind(raw: Variant) -> int:
+	if raw is int or raw is float:
+		return int(raw)
+	if not (raw is String):
+		return -1
+	var kinds: Variant = BaseTower.TowerKind
+	if kinds is Dictionary and (kinds as Dictionary).has(raw):
+		return int((kinds as Dictionary)[raw])
+	return -1
+
+func _towers_vec(raw: Variant) -> Vector2:
+	if raw is Vector2:
+		return raw
+	if raw is Dictionary:
+		var d: Dictionary = raw
+		return Vector2(float(d.get("x", 0.0)), float(d.get("y", 0.0)))
+	return Vector2.ZERO
+
+func _towers_pos_key(p: Vector2) -> String:
+	return "%d,%d" % [roundi(p.x), roundi(p.y)]
+
+func _towers_watch(delta: float) -> void:
+	if _sim_taken():
+		return
+	if not _is_own_battle():
+		_towers_pending = ""
+		return
+	var tp := _tower_placement()
+	if tp == null:
+		return
+
+	if _towers_pending != "":
+		var b := _battle()
+		if b == null or b.get_instance_id() == _towers_old_battle:
+			return
+		if int(_get(b, "phase", -1)) != 0:
+			return
+		var list: Variant = _towers_saved.get(_towers_pending)
+		_towers_pending = ""
+		if list is Array and not (list as Array).is_empty():
+			var n := _towers_apply(list)
+			if n > 0:
+				_say(_t("вернул башни: %d") % n)
+		return
+
+	_towers_accum += delta
+	if _towers_accum < 1.0:
+		return
+	_towers_accum = 0.0
+	var key2 := _towers_key()
+	if key2 == "":
+		return
+	var snap := _towers_snapshot()
+	if snap.is_empty():
+		return
+	var before: Variant = _towers_saved.get(key2)
+	if before is Array and JSON.stringify(before) == JSON.stringify(snap):
+		return
+	_towers_saved[key2] = snap
+	_towers_write_file()
 
 func _is_own_battle() -> bool:
 	return int(_get(_gm(), "selected_level", -1)) == CUSTOM_LEVEL_KEY
@@ -2387,6 +2734,7 @@ func _ed_load_path(file: String) -> bool:
 		_ed_say(_t("картинка не читается")); return false
 	_ed_img = img
 	_ed_tex = null
+	_ed_cur_path = file
 	_ed_style_level = int(d.get("style_level", 1))
 	_ed_level_key = clampi(int(d.get("level_key", _ed_style_level)), 1, 12)
 	_ed_health_buff = float(d.get("health_buff", 1.0))
@@ -2598,7 +2946,7 @@ func _browser_build() -> void:
 		if _ed_name_edit != null:
 			_ed_name_edit.text = _t("Новая карта")
 		_browser_close()
-		_root.visible = true,
+		_card.visible = true,
 		_t("Пустая карта и переход в редактор"))
 	_btn(head, _t("Папка обмена"), func() -> void:
 		var share_dir := _ed_shared_dir()
@@ -2609,7 +2957,7 @@ func _browser_build() -> void:
 		_t("Сюда кладут карты, скачанные у других игроков"))
 	_btn(head, _t("Редактор (F1)"), func() -> void:
 		_browser_close()
-		_root.visible = true,
+		_card.visible = true,
 		_t("Полный редактор: кисти, генератор, точки выхода орков"))
 	_btn(head, _t("Закрыть"), func() -> void: _browser_close())
 
@@ -2641,7 +2989,7 @@ func _browser_say(msg: String) -> void:
 func _browser_open() -> void:
 	_browser_build()
 	_hide_game_menu()
-	_root.visible = false
+	_card.visible = false
 	_browser.visible = true
 	_browser_refresh()
 
@@ -2754,7 +3102,7 @@ func _browser_edit(path: String) -> void:
 	if not _ed_load_path(path):
 		return
 	_browser_close()
-	_root.visible = true
+	_card.visible = true
 
 const LOCALE_DIR := "locale"
 const BASE_LOCALE := "ru"

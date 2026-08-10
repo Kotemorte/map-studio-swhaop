@@ -43,6 +43,9 @@ The **F1** key opens the editor directly.
 - Draw over a live battle (**F2**) and restart it with your changes
 - Check a map before playing: the mod builds the world exactly as the game
   does and warns about walls the engine would ignore
+- Run the battle at up to **256x**, stop it, or make the base immortal to see
+  how far a wave gets without losing
+- Your tower layout is remembered per map and survives restarting the game
 - Share maps as small `.json` files
 
 A ready-made map is included: **Surrounded** - a 128×128 maze with orcs
@@ -167,6 +170,9 @@ Made by [KotiMorte](https://steamcommunity.com/id/Kotemorte86).
 - Рисование прямо поверх боя (**F2**) с перезапуском боя по кнопке
 - Проверка карты до игры: мод строит мир так же, как это делает игра, и
   предупреждает о стенах, которые движок проигнорирует
+- Прогон боя на скорости до **256x**, остановка боя и бессмертная база, чтобы
+  посмотреть, докуда доходит волна, не проигрывая
+- Расстановка башен запоминается по каждой карте и переживает перезапуск игры
 - Обмен картами - это небольшие файлы `.json`
 
 В комплекте карта **Surrounded** - лабиринт 128×128, орки лезут одновременно с
