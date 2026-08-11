@@ -3110,6 +3110,7 @@ const FALLBACK_LOCALE := "en"
 
 var _loc: Dictionary = {}
 var _loc_code: String = BASE_LOCALE
+var _loc_file: String = ""
 var _loc_watch := 0.0
 var _loc_uptime := 0.0
 
@@ -3125,6 +3126,7 @@ func _game_locale() -> String:
 
 func _load_locale() -> void:
 	_loc.clear()
+	_loc_file = ""
 	var code := _game_locale()
 	_loc_code = code
 	if code.begins_with(BASE_LOCALE):
@@ -3143,7 +3145,7 @@ func _load_locale() -> void:
 		f.close()
 		if parsed is Dictionary:
 			_loc = parsed
-			_loc_code = String(name)
+			_loc_file = String(name)
 			print(_t("[MAP STUDIO] язык: %s (файл %s.json, строк %d)")
 					% [code, name, _loc.size()])
 			return

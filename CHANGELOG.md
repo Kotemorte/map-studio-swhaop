@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.2 - 2026-08-11
+
+Important fix for everyone whose game language is not English or Russian: the
+mod was close to unusable for you, and had been since the first release. If you
+play in English or Russian, nothing changes visually.
+
+When there is no translation file for your game language, the mod falls back to
+English - that part is intended. But it then remembered the name of the file it
+had loaded ("en") instead of the game language ("pl"), and the language watcher
+compares the two once per second. They never match, so the mod decided the
+language had just changed and rebuilt its whole interface - every second.
+
+That is what players saw: the map list closing itself about a second after
+opening, "Create map" seeming to close everything instead of opening the editor,
+and the frame rate swinging because the panel with tabs and map thumbnails was
+being rebuilt once a second.
+
+Measured on the released v1.0, extra rebuilds in 4 seconds:
+
+| game language | locale folder | rebuilds | window alive |
+| --- | --- | --- | --- |
+| ru | no file needed | 0 | yes |
+| en | `en.json`, name matches | 0 | yes |
+| pl | no `pl.json` | 4 | no |
+| de | no `de.json` | 4 | no |
+| pl | `pl.json` present | 0 | yes |
+| pt_BR | only `pt.json` | 4 | no |
+
+A matching translation file hid the bug, which is why Russian and English
+players never saw it. And `pt_BR` breaks even with `pt.json` present, because
+the names differ - so this could not have been fixed by adding translations.
+
+Fixed: the mod now remembers the game language and keeps the loaded file name
+separately, for the log message only. Verified on the same table - zero extra
+rebuilds in all six cases, window alive; a real language change still works,
+exactly one rebuild with the translation picked up.
+
+Everything added in v1.1 is unchanged.
+
 ## v1.1 - 2026-08-11
 
 Battle testing: run the wave fast, stop it, keep the base alive, and stop
